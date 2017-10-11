@@ -3,21 +3,24 @@ package io.mycat.mycat2.tasks;
 import java.io.IOException;
 import java.net.InetSocketAddress;
 import java.nio.channels.SelectionKey;
+import java.nio.channels.Selector;
+import java.nio.channels.SocketChannel;
 import java.security.NoSuchAlgorithmException;
 
-import io.mycat.mycat2.beans.MySQLBean;
-import io.mycat.mycat2.beans.SchemaBean;
+import io.mycat.mycat2.beans.MySQLMetaBean;
+import io.mycat.mycat2.beans.conf.SchemaBean;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import io.mycat.mycat2.AbstractMySQLSession.CurrPacketType;
 import io.mycat.mycat2.MySQLSession;
-import io.mycat.mycat2.beans.MySQLDataSource;
 import io.mycat.mysql.Capabilities;
 import io.mycat.mysql.packet.AuthPacket;
 import io.mycat.mysql.packet.ErrorPacket;
 import io.mycat.mysql.packet.HandshakePacket;
 import io.mycat.mysql.packet.MySQLPacket;
-import io.mycat.util.CharsetUtil;
+import io.mycat.proxy.BufferPool;
+import io.mycat.util.ParseUtil;
 import io.mycat.util.SecurityUtil;
 
 /**
@@ -26,70 +29,82 @@ import io.mycat.util.SecurityUtil;
  * @author wuzhihui
  *
  */
-public class BackendConCreateTask extends AbstractBackendIOTask {
+public class BackendConCreateTask extends AbstractBackendIOTask<MySQLSession> {
 	private static Logger logger = LoggerFactory.getLogger(BackendConCreateTask.class);
 	private HandshakePacket handshake;
 	private boolean welcomePkgReceived = false;
-	private MySQLDataSource ds;
+	private MySQLMetaBean mySQLMetaBean;
+	private SchemaBean schema;
+	private MySQLSession session;
 
-	public BackendConCreateTask(MySQLSession session, MySQLDataSource ds) {
-		super(session);
-		this.ds = ds;
+	public BackendConCreateTask(BufferPool bufPool, Selector nioSelector, MySQLMetaBean mySQLMetaBean, SchemaBean schema,AsynTaskCallBack<MySQLSession> callBack)
+			throws IOException {
+		String serverIP = mySQLMetaBean.getDsMetaBean().getIp();
+		int serverPort = mySQLMetaBean.getDsMetaBean().getPort();
+		logger.info("Connecting to backend MySQL Server " + serverIP + ":" + serverPort);
+		InetSocketAddress serverAddress = new InetSocketAddress(serverIP, serverPort);
+		SocketChannel backendChannel = SocketChannel.open();
+		backendChannel.configureBlocking(false);
+		backendChannel.connect(serverAddress);
+		session = new MySQLSession(bufPool, nioSelector, backendChannel);
+		session.setMySQLMetaBean(mySQLMetaBean);
+		this.setSession(session, false);
+		this.mySQLMetaBean = mySQLMetaBean;
+		this.schema = schema;
+		this.callBack = callBack;
 	}
 
 	@Override
-	public void onBackendRead(MySQLSession session) throws IOException {
-		// 不透传的状态下，需要自己控制Buffer的状态，这里每次从Socket中读取并写Buffer数据都切回初始Write状态
-		session.frontBuffer.reset();
-		if (!session.readFromChannel(session.frontBuffer, session.backendChannel)
-				|| !session.resolveMySQLPackage(session.frontBuffer, session.curBackendMSQLPackgInf, false)) {// 没有读到数据或者报文不完整
+	public void onSocketRead(MySQLSession session) throws IOException {
+		session.proxyBuffer.reset();
+		if (!session.readFromChannel() || CurrPacketType.Full != session.resolveMySQLPackage(session.proxyBuffer,
+				session.curMSQLPackgInf, false)) {// 没有读到数据或者报文不完整
 			return;
 		}
 
 		if (!welcomePkgReceived) {
 			handshake = new HandshakePacket();
-			handshake.read(this.session.frontBuffer);
+			handshake.read(this.session.proxyBuffer);
 
 			// 设置字符集编码
 			int charsetIndex = (handshake.serverCharsetIndex & 0xff);
-			String charset = CharsetUtil.getCharset(charsetIndex);
-			if (charset != null) {
-				// conn.setCharset(charsetIndex, charset);
-			} else {
-				String errmsg = "Unknown charsetIndex:" + charsetIndex + " of " + session.getSessionId();
-				logger.warn(errmsg);
-				return;
-			}
 			// 发送应答报文给后端
-			final MySQLBean mySQLBean = ds.getConfig();
 			AuthPacket packet = new AuthPacket();
 			packet.packetId = 1;
 			packet.clientFlags = initClientFlags();
 			packet.maxPacketSize = 1024 * 1000;
 			packet.charsetIndex = charsetIndex;
-			packet.user = mySQLBean.getUser();
+			packet.user = mySQLMetaBean.getDsMetaBean().getUser();
 			try {
-				packet.password = passwd(mySQLBean.getPassword(), handshake);
+				packet.password = passwd(mySQLMetaBean.getDsMetaBean().getPassword(), handshake);
 			} catch (NoSuchAlgorithmException e) {
 				throw new RuntimeException(e.getMessage());
 			}
-			SchemaBean schema = session.schema;
-			packet.database = (schema == null) ? null : schema.getName();
+			// SchemaBean schema = session.schema;
+			// 创建连接时，默认不主动同步数据库
+//			if(schema!=null&&schema.getDefaultDN()!=null){
+//				packet.database = schema.getDefaultDN().getDatabase();
+//			}
 
 			// 不透传的状态下，需要自己控制Buffer的状态，这里每次写数据都切回初始Write状态
-			session.frontBuffer.reset();
-			packet.write(session.frontBuffer);
-			session.frontBuffer.flip();
-			session.writeToChannel(session.frontBuffer, session.backendChannel);
+			session.proxyBuffer.reset();
+			packet.write(session.proxyBuffer);
+			session.proxyBuffer.flip();
+			// 不透传的状态下， 自己指定需要写入到channel中的数据范围
+			// 没有读取,直接透传时,需要指定 透传的数据 截止位置
+			session.proxyBuffer.readIndex = session.proxyBuffer.writeIndex;
+			session.writeToChannel();
 			welcomePkgReceived = true;
 		} else {
 			// 认证结果报文收到
-			if (session.curBackendMSQLPackgInf.pkgType == MySQLPacket.OK_PACKET) {
-				logger.info("backend authed suceess ");
+			if (session.curMSQLPackgInf.pkgType == MySQLPacket.OK_PACKET) {
+				logger.debug("backend authed suceess ");
 				this.finished(true);
-			} else if (session.curBackendMSQLPackgInf.pkgType == MySQLPacket.ERROR_PACKET) {
+			} else if (session.curMSQLPackgInf.pkgType == MySQLPacket.ERROR_PACKET) {
 				errPkg = new ErrorPacket();
-				errPkg.read(session.frontBuffer);
+				errPkg.packetId = session.proxyBuffer.getByte(session.curMSQLPackgInf.startPos 
+																+ ParseUtil.mysql_packetHeader_length);
+				errPkg.read(session.proxyBuffer);
 				logger.warn("backend authed failed. Err No. " + errPkg.errno + "," + errPkg.message);
 				this.finished(false);
 			}
@@ -97,29 +112,22 @@ public class BackendConCreateTask extends AbstractBackendIOTask {
 	}
 
 	@Override
-	public void onBackendConnect(MySQLSession userSession, boolean success, String msg) throws IOException {
+	public void onConnect(SelectionKey theKey, MySQLSession userSession, boolean success, String msg)
+			throws IOException {
 		String logInfo = success ? " backend connect success " : "backend connect failed " + msg;
-		logger.info(logInfo + " channel " + userSession.backendChannel);
+		logger.debug("{}  sessionId = {}, {}:{}",logInfo, userSession.getSessionId(),userSession.getMySQLMetaBean().getDsMetaBean().getIp(), userSession.getMySQLMetaBean().getDsMetaBean().getPort());
 		if (success) {
-			InetSocketAddress serverRemoteAddr = (InetSocketAddress) userSession.backendChannel.getRemoteAddress();
-			InetSocketAddress serverLocalAddr = (InetSocketAddress) userSession.backendChannel.getLocalAddress();
-			userSession.backendAddr = "local port:" + serverLocalAddr.getPort() + ",remote "
-					+ serverRemoteAddr.getHostString() + ":" + serverRemoteAddr.getPort();
-			userSession.backendKey = userSession.backendChannel.register(userSession.nioSelector, SelectionKey.OP_READ,
-					userSession);
+			InetSocketAddress serverRemoteAddr = (InetSocketAddress) userSession.channel.getRemoteAddress();
+			InetSocketAddress serverLocalAddr = (InetSocketAddress) userSession.channel.getLocalAddress();
+			userSession.addr = "local port:" + serverLocalAddr.getPort() + ",remote " + serverRemoteAddr.getHostString()
+					+ ":" + serverRemoteAddr.getPort();
+			userSession.channelKey.interestOps(SelectionKey.OP_READ);
 
 		} else {
 			errPkg = new ErrorPacket();
 			errPkg.message = logInfo;
 			finished(false);
 
-		}
-	}
-
-	protected void onFinished(boolean success) {
-		if (!success) {
-			session.backendChannel = null;
-			session.backendKey = null;
 		}
 	}
 
@@ -163,9 +171,5 @@ public class BackendConCreateTask extends AbstractBackendIOTask {
 		return flag;
 	}
 
-	@Override
-	public void onBackendSocketClosed(MySQLSession userSession, boolean normal) {
-		logger.warn("not handlered back connection close event ,session " + userSession.getSessionId());
-	}
-
+	
 }

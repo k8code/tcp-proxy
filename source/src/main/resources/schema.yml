@@ -1,0 +1,6 @@
+schemas:
+  - name: test
+    schemaType: DB_IN_ONE_SERVER
+    defaultDN:
+      database: test
+      replica: test

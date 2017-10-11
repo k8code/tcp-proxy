@@ -6,10 +6,12 @@ import java.nio.channels.SelectionKey;
 import java.nio.channels.Selector;
 import java.nio.channels.SocketChannel;
 import java.sql.Timestamp;
-import java.util.ArrayList;
-import java.util.Arrays;
+import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
 
+import io.mycat.mycat2.ProxyStarter;
+import io.mycat.mycat2.beans.conf.ProxyConfig;
+import io.mycat.proxy.ConfigEnum;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -27,14 +29,13 @@ import io.mycat.proxy.man.packet.NodeRegInfoPacket;
  *
  */
 public class MyCluster {
-
 	private static Logger logger = LoggerFactory.getLogger(MyCluster.class);
 
 	public enum ClusterState {
 		Joining(0), LeaderElection(1), Clustered(2);
 		private byte stateCode;
 
-		private ClusterState(int stateCode) {
+		ClusterState(int stateCode) {
 			this.stateCode = (byte) stateCode;
 		}
 
@@ -45,23 +46,30 @@ public class MyCluster {
 		public byte getSateCode() {
 			return this.stateCode;
 		}
+	}
 
-	};
-
-	private ConcurrentHashMap<String, ClusterNode> allNodes = new ConcurrentHashMap<>();
+	public ConcurrentHashMap<String, ClusterNode> allNodes = new ConcurrentHashMap<>();
 	private final ClusterNode myNode;
 	private ClusterNode myLeader;
 	private ClusterState clusterState = ClusterState.Joining;
 	private long lastClusterStateTime;
 	private final Selector nioSelector;
 
-	public MyCluster(Selector nioSelector, ClusterNode myNode, ArrayList<ClusterNode> allClusterNodes) {
-		this.myNode = myNode;
+	public Map<Byte, ConfigConfirmBean> configConfirmMap = new LinkedHashMap<>();
+
+	public MyCluster(Selector nioSelector, String myNodeId, ArrayList<ClusterNode> allClusterNodes) {
 		this.nioSelector = nioSelector;
+		ClusterNode myNode = null;
 		for (ClusterNode node : allClusterNodes) {
+			if (myNodeId.equals(node.id)) {
+				myNode = node;
+			}
 			allNodes.put(node.id, node);
 		}
-
+		myNode.setState(NodeState.Online);
+		this.myNode = myNode;
+		ProxyConfig proxyConfig = ProxyRuntime.INSTANCE.getConfig().getConfig(ConfigEnum.PROXY);
+		this.myNode.proxyPort = proxyConfig.getProxy().getPort();
 	}
 
 	/**
@@ -98,14 +106,15 @@ public class MyCluster {
 	public void onClusterNodeUp(NodeRegInfoPacket pkg, AdminSession session) throws IOException {
 		String theNodeId = pkg.getNodeId();
 		ClusterNode theNode = allNodes.get(theNodeId);
+		theNode.proxyPort = pkg.getProxyPort();
 		theNode.setNodeStartTime(pkg.getStartupTime());
 		theNode.setState(NodeState.Online);
 		theNode.setMyLeaderId(pkg.getMyLeader());
 		theNode.setMyClusterState(pkg.getClusterState(), pkg.getLastClusterStateTime());
-		logger.info("Node online " + theNode.id + " at " + theNode.ip + ":" + theNode.port + " started at "
-				+ new Timestamp(theNode.getNodeStartTime()) + " cluster leader " + theNode.getMyLeaderId()
-				+ " cluster state " + theNode.getMyClusterState() + " cluster time:"
-				+ theNode.getLastClusterStateTime());
+		logger.info("Node online {} at {}:{} started at {} cluster leader {} cluster state {} cluster time:{} proxy port:{}",
+				theNode.id, theNode.ip, theNode.port, new Timestamp(theNode.getNodeStartTime()), theNode.getMyLeaderId(),
+				theNode.getMyClusterState(), theNode.getLastClusterStateTime(), theNode.proxyPort);
+
 		if (clusterState == ClusterState.Joining || clusterState == ClusterState.LeaderElection) {
 			if (theNode.getMyClusterState() == ClusterState.Clustered) {
 				myLeader = this.findNode(theNode.getMyLeaderId());
@@ -114,49 +123,60 @@ public class MyCluster {
 					// 向Leader发送请求加入集群的报文
 					JoinCLusterReqPacket joinPkg = new JoinCLusterReqPacket(getMyAliveNodes());
 					findSession(myLeader.id).answerClientNow(joinPkg);
-					return;
 				}
-
-			} else if (getMyAliveNodesCount() >= allNodes.size() / 2 && imSmallestAliveNode()) {
+			} else if (checkIfLeader()) {
 				// 是连接中当前编号最小的节点，当选为Leader
-				logger.info("I'm smallest alive node ,and exceeded 1/2 nodes alive ,so I'm the King now !");
+				logger.info("I'm smallest alive node, and exceeded 1/2 nodes alive, so I'm the King now!");
+				// 集群主已产生，继续加载配置，提供服务
+				ProxyStarter.INSTANCE.startProxy(true);
+
 				this.setClusterState(ClusterState.Clustered);
+				this.myNode.setMyLeaderId(getMyNodeId());
 				this.myLeader = this.myNode;
 				JoinCLusterNotifyPacket joinReps = createJoinNotifyPkg(session,JoinCLusterNotifyPacket.JOIN_STATE_NEED_ACK);
 				notifyAllNodes(session,joinReps);
-
 			} else if (theNode.getMyClusterState() == ClusterState.LeaderElection) {
 				setClusterState(ClusterState.LeaderElection);
 			}
 		} else if (myLeader == myNode) {// 当前是集群状态，并且自己是Leader，就回话，可以加入集群
 			session.answerClientNow(createJoinNotifyPkg(session,JoinCLusterNotifyPacket.JOIN_STATE_NEED_ACK));
 		}
-
 	}
 
-	private void notifyAllNodes(AdminSession session,ManagePacket packet) 
-	{
-		for (Session theSession : session.getMySessionManager().getAllSessions()) {
-			AdminSession nodeSession = (AdminSession) theSession;
-			if (nodeSession.isFrontOpen()) {
-				try
-				{
-				nodeSession.answerClientNow(packet);
-				}catch(Exception e)
-				{
-					logger.warn("notify node err "+nodeSession.getNodeId(),e);
-				}
-			}
-
+	private boolean checkIfLeader() {
+		int halfAllCount = allNodes.size() >> 1;
+		int myAliveCount = getMyAliveNodesCount();
+		if (nodesIsOdd()) {
+			//奇数个节点，判断是否>一半
+			return (myAliveCount > halfAllCount && imSmallestAliveNode());
+		} else {
+			//偶数个节点，判断是否>一半 或者 =一半时主节点是集群中最小的节点
+			return (myAliveCount > halfAllCount && imSmallestAliveNode()) || (myAliveCount == halfAllCount && imSmallestInNodes());
 		}
 	}
+
+	private void notifyAllNodes(AdminSession session,ManagePacket packet) {
+		for (Session theSession : session.getMySessionManager().getAllSessions()) {
+			AdminSession nodeSession = (AdminSession) theSession;
+			if (nodeSession.isChannelOpen()) {
+				try {
+					nodeSession.answerClientNow(packet);
+				} catch (Exception e) {
+					logger.warn("notify node err " + nodeSession.getNodeId(),e);
+				}
+			}
+		}
+	}
+
 	private JoinCLusterNotifyPacket createJoinNotifyPkg(AdminSession session,byte joinState) {
-		JoinCLusterNotifyPacket respPacket = new JoinCLusterNotifyPacket(session.cluster().getMyAliveNodes(),
-				ProxyRuntime.INSTANCE.getProxyConfig().getMyConfigFileVersion());
+		JoinCLusterNotifyPacket respPacket = new JoinCLusterNotifyPacket(session.cluster().getMyAliveNodes());
 		respPacket.setJoinState(joinState);
 		return respPacket;
 	}
 
+	/**
+	 * 判断当前节点是否是在online状态下最小的节点
+     */
 	private boolean imSmallestAliveNode() {
 		String myId = this.getMyNodeId();
 		for (ClusterNode curNode : this.allNodes.values()) {
@@ -164,6 +184,19 @@ public class MyCluster {
 				if (myId.compareTo(curNode.id) > 0) {
 					return false;
 				}
+			}
+		}
+		return true;
+	}
+
+	/**
+	 * 判断当前节点是否是在所有配置中最小的节点
+     */
+	private boolean imSmallestInNodes() {
+		String myId = this.getMyNodeId();
+		for (ClusterNode curNode : this.allNodes.values()) {
+			if (myId.compareTo(curNode.id) > 0) {
+				return false;
 			}
 		}
 		return true;
@@ -183,7 +216,7 @@ public class MyCluster {
 	}
 
 	private int getMyAliveNodesCount() {
-		int aliveCount = 1;
+		int aliveCount = 0;
 		for (ClusterNode curNode : this.allNodes.values()) {
 			if (curNode.getState() == NodeState.Online) {
 				aliveCount++;
@@ -201,26 +234,58 @@ public class MyCluster {
 		return null;
 	}
 
-	public void onClusterNodeDown(String nodeId, AdminSession session)  {
+	public void onClusterNodeDown(String nodeId, AdminSession session) throws IOException {
 		ClusterNode theNode = allNodes.get(nodeId);
 		theNode.setState(NodeState.Offline);
-		logger.info("Node offline " + theNode.id + " at " + theNode.ip + ":" + theNode.port + " started at "
-				+ new Timestamp(theNode.getNodeStartTime()));
-		if (theNode == myLeader) {
-			logger.warn("Leader crashed " + myLeader.id + ' ' + this.getMyNodeId() + ",enter Leader election state ");
-			this.setClusterState(ClusterState.LeaderElection);
-		} else if (myLeader == myNode) {
-               //如果集群数量小于1/2就通知集群解散
-			   if(this.getMyAliveNodesCount()<this.allNodes.size()/2)
-			   {
-				   logger.warn("Less then 1/2 mumbers  in my Kingdom ,so I quit ");
-				   this.setClusterState(ClusterState.LeaderElection);
-				   this.myLeader=null;
-				   JoinCLusterNotifyPacket joinReps = createJoinNotifyPkg(session,JoinCLusterNotifyPacket.JOIN_STATE_DENNIED);
-					notifyAllNodes(session,joinReps);
-			   }
-		}
+		logger.info("Node offline {} at {}:{} started at {}", theNode.id, theNode.ip, theNode.port, new Timestamp(theNode.getNodeStartTime()));
 
+		if (theNode == myLeader) {
+			if (checkIfLeader()) {
+				logger.info("My Leader crashed, I'm smallest alive node, and exceeded 1/2 nodes alive, so I'm the King now!");
+				this.setClusterState(ClusterState.Clustered);
+				this.myNode.setMyLeaderId(getMyNodeId());
+				this.myLeader = this.myNode;
+
+				// 集群主切换，不用重启proxy，在新的主节点上启动心跳
+				ProxyRuntime.INSTANCE.startHeartBeatScheduler();
+
+				JoinCLusterNotifyPacket joinReps = createJoinNotifyPkg(session,JoinCLusterNotifyPacket.JOIN_STATE_NEED_ACK);
+				notifyAllNodes(session, joinReps);
+			} else {
+				logger.warn("Leader crashed {} {}, enter Leader election state", myLeader.id, getMyNodeId());
+				this.setClusterState(ClusterState.LeaderElection);
+
+				// 当前集群失去主节点，关闭proxy服务
+				ProxyStarter.INSTANCE.stopProxy();
+			}
+		} else if (myLeader == myNode) {
+			if (checkIfNeedDismissCluster()) {
+				logger.warn("Less than 1/2 numbers in my Kingdom, so I quit");
+				this.setClusterState(ClusterState.LeaderElection);
+				this.myLeader=null;
+				JoinCLusterNotifyPacket joinReps = createJoinNotifyPkg(session, JoinCLusterNotifyPacket.JOIN_STATE_DENNIED);
+				notifyAllNodes(session, joinReps);
+
+				// 当前集群失去主节点，关闭proxy服务
+				ProxyStarter.INSTANCE.stopProxy();
+			}
+		}
+	}
+
+	private boolean checkIfNeedDismissCluster() {
+		int halfAllCount = allNodes.size() >> 1;
+		int myAliveCount = getMyAliveNodesCount();
+		if (nodesIsOdd()) {
+			//奇数个节点，判断是否>一半
+			return myAliveCount <= halfAllCount;
+		} else {
+			//偶数个节点，判断是否>一半 或者 =一半时主节点是集群中最小的节点
+			return (myAliveCount < halfAllCount) || (myAliveCount == halfAllCount && !imSmallestInNodes());
+		}
+	}
+
+	private boolean nodesIsOdd() {
+		return (allNodes.size() & 1) == 1;
 	}
 
 	public String getMyNodeId() {
@@ -243,6 +308,10 @@ public class MyCluster {
 		return myNode;
 	}
 
+	public void setMyLeader(ClusterNode myLeader) {
+		this.myLeader = myLeader;
+	}
+
 	public ClusterState getClusterState() {
 		return clusterState;
 	}
@@ -255,5 +324,4 @@ public class MyCluster {
 		this.clusterState = clusterState;
 		this.lastClusterStateTime = System.currentTimeMillis();
 	}
-
 }

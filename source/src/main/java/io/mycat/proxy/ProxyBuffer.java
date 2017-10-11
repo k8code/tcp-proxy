@@ -1,44 +1,76 @@
 package io.mycat.proxy;
 
-/**
- * 可重用的Buffer，连续读或者写，当空间不够时Compact擦除之前用过的空间，
- * 处于写状态或者读状态之一，不能同时读写， 只有数据被操作完成（读完或者写完）后State才能被改变（flip方法或手工切换状态），同时可能要改变Owner，chanageOwn
- */
 import java.nio.ByteBuffer;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+/**
+ * 可重用的Buffer，连续读或者写，当空间不够时Compact擦除之前用过的空间， 处于写状态或者读状态之一，不能同时读写，
+ * 只有数据被操作完成（读完或者写完）后State才能被改变（flip方法或手工切换状态），同时可能要改变Owner，chanageOwn
+ *
+ * 需要外部 关心的状态为 writeIndex 写入buffer 开始位置 readIndex 读取开始位置 inReading 当前buffer 读写状态
+ * frontUsing owner 不需要外部关心的状态为 readMark 向channel 中写入数据时的开始位置, 该状态由
+ * writeToChannel 自动维护,不需要外部显式指定 preUsing 上一个owner 仅在 write==0
+ * 或只写了一部分数据的情况下,需要临时改变 owner .本次写入完成后,需要根据preUsing 自动切换回来 使用流程
+ * 一、透传、只前端读写、只后端读写场景 1. 从channel 向 buffer 写入数据 始终从 writeIndex 开始写入 , inReading
+ * 状态一定为 false 写入状态 2. 读取 buffer 中数据 读取的数据范围是 readIndex --- writeIndex 之间的数据. 3.
+ * 向 channel 写入数据前, flip 切换读写状态 4. 数据全部透传完成（例如:整个结果集透传完成）后 changeOwner,否则 owner
+ * 不变. 5. 从 buffer 向 channel 写入数据时,写入 readMark--readIndex 之间的数据. 6. 写完成后 flip
+ * 切换读写状态。同时 如果 readIndex > buffer.capacity() * 2 / 3 进行一次压缩 7. 从 channel
+ * 向buffer 写入数据时，如果 writeIndex > buffer.capacity() * 1 / 3 进行一次压缩
+ *
+ * 二、没有读取数据,向buffer中写入数据后 直接 write 到 channel的场景 1. 在写入到 channel 时 ,需要显式 指定
+ * readIndex = writeIndex; 2. 其他步骤 同 （透传、只前端读写、只后端读写场景）场景
+ *
+ * @author yanjunli
+ *
+ */
 public class ProxyBuffer {
+	
 	protected static Logger logger = LoggerFactory.getLogger(ProxyBuffer.class);
 	private final ByteBuffer buffer;
-	
-	
+
+	// 对于Write to Buffer
+	// 的操作，readIndex表示当前可读的数据截止位置，readMark为数据开始位置，用户可以标记，下次写入Buffer时，从readMark的位置继续写入，
+	//写入操作执行时，readMark会累加，当readMark==readIndex，表示指定的数据已经全部写入到Channel中，即无可写内容
+
+	// 对于Read to
+	// Channel的操作，readMark表示读取数据截止的位置，writeIndex表示数据截止的位置，0-readMark之间的数据是要被写入CHannel的，写入Channel
+	// 后，Write 完成后检查optMark；当writeIndex > 1/3 capacity 时 执行 compact。将readIndex 与
+	// writeIndex 之间的数据移动到buffer 开始位置
+
+	/*
+	 * 写入数据开始位置， 从socket buffer 写入数据时,从该位置开始写入
+	 */
+	public int writeIndex;
+
+	/*
+	 * 用于标记透传时 的结束位置 向socket 中吸入数据时,用于标记写入到socket 中数据的结束位置
+	 */
+	public int readIndex;
+
 	/**
-	 * 通道的读写状态标标识，false为写入，true 为读取
+	 * 当前buffer 的读写状态 . 默认为写入状态 false 从 channel 中 向 buffer 写入数据 即： write 状态 true
+	 * 从buffer 向 channel 写出数据 即： read 状态
 	 */
 	private boolean inReading = false;
-	
-	
-	/**
-	 * 通道读取的状态标识
+
+	/*
+	 * ********************************************************************* 以下
+	 * 两个状态 ,不推荐 外部使用. 会在进行网络读写时,网络读写程序内部使用.
+	 * *********************************************************************
 	 */
-	public BufferOptState readState = new BufferOptState();
-	
-	
-	/**
-	 * 通道数据写入状态的标识
+
+	/*
+	 * 用于标记透传时数据开始位置, 这个指针不推荐外部用户 显示调用，由网络读写状态自动管理 为减少 compact 次数. 引入第三个指针. 在
+	 * writeIndex > 2/3 capacity 时 执行 compact
 	 */
-	public BufferOptState writeState = new BufferOptState();
-	//一般都是后端连接率先给客户端发起信息，所以后端默认使用
-	private boolean frontUsing=false;
+	public int readMark;
 
 	public ProxyBuffer(ByteBuffer buffer) {
 		super();
 		this.buffer = buffer;
-		writeState.startPos = 0;
-		writeState.optPostion = 0;
-		writeState.optLimit = buffer.capacity();
 	}
 
 	public boolean isInReading() {
@@ -50,92 +82,69 @@ public class ProxyBuffer {
 	}
 
 	/**
+	 * 写数据到Socket中时，是否写完了预先指定的Buffer内容
+	 *
+	 * @return
+	 */
+	public boolean writeFinished() {
+
+		//buffer.limit(proxyBuffer.readIndex);
+		//buffer.position(proxyBuffer.readMark);
+		return readIndex==readMark;
+	}
+
+
+	/**
 	 * 需要谨慎使用，调用者需要清除当前Buffer所处的状态！！
-	 * 
+	 *
 	 * @return ByteBuffer
 	 */
 	public ByteBuffer getBuffer() {
 		return buffer;
 	}
 
-	public void setInReading(boolean inReading) {
-		this.inReading = inReading;
-	}
-
-	public void changeOwner(boolean front)
-	{
-		this.frontUsing=front;
-	}
 	/**
-	 * 交换Read与Write状态
+	 * 重置Buffer，所有Index归零，Buffer清空，并且设置为writing状态
 	 */
-	public void flip() {
-
-		if (this.inReading) {
-			// 转为可写状态
-			inReading = false;
-			writeState.startPos = 0;
-			writeState.optPostion = 0;
-			writeState.optLimit = buffer.capacity();
-			writeState.optedTotalLength = 0;
-			// 转为可写状态时恢复读状态为初始（不可读）
-			readState.startPos = 0;
-			readState.optPostion = 0;
-			readState.optLimit = 0;
-		} else {
-			// 转为读状态
-			inReading = true;
-			//读取状态的开始指针指定为写入状态的开始指针
-			readState.startPos = writeState.startPos;
-			//opt指针指定为状态开始的指针
-			readState.optPostion = writeState.startPos;
-			//读取的最大长度指定为现写入的长度
-			readState.optLimit = writeState.optPostion;
-			//总字节数转换为0
-			readState.optedTotalLength = 0;
-		}
-		logger.debug("flip, new state {} , write state: {} ,read state {}", this.inReading ? "read" : "write",
-				this.writeState, this.readState);
-
+	public void reset() {
+		this.inReading=false;
+		this.readMark = 0;
+		this.readIndex = 0;
+		this.writeIndex = 0;
+		this.buffer.clear();
 	}
 
 	/**
 	 * 只能用在读状态下，跳过指定的N个字符
-	 * 
+	 *
 	 * @param step
 	 */
 	public void skip(int step) {
-		this.readState.optPostion += step;
-	}
-
-	public BufferOptState getReadOptState() {
-		return this.readState;
-	}
-
-	public BufferOptState getWriteOptState() {
-		return this.writeState;
+		readIndex += step;
 	}
 
 	/**
 	 * 写状态时候，如果数据写满了，可以调用此方法移除之前的旧数据
 	 */
-	public void compact(boolean synReadStatePos) {
-		if (this.inReading) {
-			throw new RuntimeException("not in writing state ,can't Compact");
-		}
-		this.buffer.position(writeState.startPos);
-		this.buffer.limit(writeState.optPostion);
-		this.buffer.compact();
-		int offset = writeState.startPos;
-		writeState.startPos = 0;
-		writeState.optPostion = buffer.limit();
-		writeState.optLimit = buffer.capacity();
-		buffer.limit(buffer.capacity());
-		if (synReadStatePos) {
-			readState.optPostion -= offset;
-			readState.optLimit -= offset;
-		}
+	public void compact() {
 
+		this.buffer.position(readMark);
+		this.buffer.limit(writeIndex);
+		this.buffer.compact();
+		readIndex -= readMark;
+		readMark = 0;
+		writeIndex = buffer.position();
+	}
+
+	/**
+	 * 交换Read与Write状态
+	 */
+	public void flip() {
+		if (this.inReading) {
+			this.inReading = false;
+		} else {
+			this.inReading = true;
+		}
 	}
 
 	public ProxyBuffer writeBytes(byte[] bytes) {
@@ -144,31 +153,34 @@ public class ProxyBuffer {
 	}
 
 	public long readFixInt(int length) {
-		long val = getInt(readState.optPostion, length);
-		this.readState.optPostion += length;
+		long val = getInt(readIndex, length);
+		readIndex += length;
 		return val;
 	}
 
+	public long getFixInt(int index,int length){
+		return getInt(index, length);
+	}
+
 	public long readLenencInt() {
-		int index = readState.optPostion;
-		long len = getInt(readState.optPostion, 1) & 0xff;
+		int index = readIndex;
+		long len = getInt(index, 1) & 0xff;
 		if (len < 251) {
-			this.readState.optPostion += 1;
+			readIndex += 1;
 			return getInt(index, 1);
 		} else if (len == 0xfc) {
-			this.readState.optPostion += 2;
+			readIndex += 2;
 			return getInt(index + 1, 2);
 		} else if (len == 0xfd) {
-			this.readState.optPostion += 3;
+			readIndex += 3;
 			return getInt(index + 1, 3);
 		} else {
-			this.readState.optPostion += 8;
+			readIndex += 8;
 			return getInt(index + 1, 8);
 		}
 	}
 
 	public long getInt(int index, int length) {
-		buffer.limit(index + length);
 		buffer.position(index);
 		long rv = 0;
 		for (int i = 0; i < length; i++) {
@@ -179,7 +191,6 @@ public class ProxyBuffer {
 	}
 
 	public byte[] getBytes(int index, int length) {
-		buffer.limit(length + index);
 		buffer.position(index);
 		byte[] bytes = new byte[length];
 		buffer.get(bytes);
@@ -187,7 +198,6 @@ public class ProxyBuffer {
 	}
 
 	public byte getByte(int index) {
-		buffer.limit(index + 1);
 		buffer.position(index);
 		byte b = buffer.get();
 		return b;
@@ -199,8 +209,8 @@ public class ProxyBuffer {
 	}
 
 	public String readFixString(int length) {
-		byte[] bytes = getBytes(readState.optPostion, length);
-		readState.optPostion += length;
+		byte[] bytes = getBytes(readIndex, length);
+		readIndex += length;
 		return new String(bytes);
 	}
 
@@ -212,10 +222,10 @@ public class ProxyBuffer {
 	}
 
 	public String readLenencString() {
-		int strLen = (int) getLenencInt(readState.optPostion);
+		int strLen = (int) getLenencInt(readIndex);
 		int lenencLen = getLenencLength(strLen);
-		byte[] bytes = getBytes(readState.optPostion + lenencLen, strLen);
-		this.readState.optPostion += strLen + lenencLen;
+		byte[] bytes = getBytes(readIndex + lenencLen, strLen);
+		readIndex += strLen + lenencLen;
 		return new String(bytes);
 	}
 
@@ -226,11 +236,11 @@ public class ProxyBuffer {
 	public String readVarString(int length) {
 		return readFixString(length);
 	}
-
+	
 	public String getNULString(int index) {
 		int strLength = 0;
 		int scanIndex = index;
-		while (scanIndex < readState.optLimit) {
+		while (scanIndex < writeIndex) {
 			if (getByte(scanIndex++) == 0) {
 				break;
 			}
@@ -241,8 +251,8 @@ public class ProxyBuffer {
 	}
 
 	public String readNULString() {
-		String rv = getNULString(readState.optPostion);
-		readState.optPostion += rv.getBytes().length + 1;
+		String rv = getNULString(readIndex);
+		readIndex += rv.getBytes().length + 1;
 		return rv;
 	}
 
@@ -256,8 +266,8 @@ public class ProxyBuffer {
 	}
 
 	public ProxyBuffer writeFixInt(int length, long val) {
-		putFixInt(writeState.optPostion, length, val);
-		writeState.optPostion += length;
+		putFixInt(writeIndex, length, val);
+		writeIndex += length;
 		return this;
 	}
 
@@ -279,19 +289,19 @@ public class ProxyBuffer {
 
 	public ProxyBuffer writeLenencInt(long val) {
 		if (val < 251) {
-			putByte(writeState.optPostion++, (byte) val);
+			putByte(writeIndex++, (byte) val);
 		} else if (val >= 251 && val < (1 << 16)) {
-			putByte(writeState.optPostion++, (byte) 0xfc);
-			putFixInt(writeState.optPostion, 2, val);
-			writeState.optPostion += 2;
+			putByte(writeIndex++, (byte) 0xfc);
+			putFixInt(writeIndex, 2, val);
+			writeIndex += 2;
 		} else if (val >= (1 << 16) && val < (1 << 24)) {
-			putByte(writeState.optPostion++, (byte) 0xfd);
-			putFixInt(writeState.optPostion, 3, val);
-			writeState.optPostion += 3;
+			putByte(writeIndex++, (byte) 0xfd);
+			putFixInt(writeIndex, 3, val);
+			writeIndex += 3;
 		} else {
-			putByte(writeState.optPostion++, (byte) 0xfe);
-			putFixInt(writeState.optPostion, 8, val);
-			writeState.optPostion += 8;
+			putByte(writeIndex++, (byte) 0xfe);
+			putFixInt(writeIndex, 8, val);
+			writeIndex += 8;
 		}
 		return this;
 	}
@@ -302,8 +312,8 @@ public class ProxyBuffer {
 	}
 
 	public ProxyBuffer writeFixString(String val) {
-		putBytes(writeState.optPostion, val.getBytes());
-		writeState.optPostion += val.getBytes().length;
+		putBytes(writeIndex, val.getBytes());
+		writeIndex += val.getBytes().length;
 		return this;
 	}
 
@@ -315,9 +325,9 @@ public class ProxyBuffer {
 	}
 
 	public ProxyBuffer writeLenencString(String val) {
-		putLenencString(writeState.optPostion, val);
+		putLenencString(writeIndex, val);
 		int lenencLen = getLenencLength(val.getBytes().length);
-		writeState.optPostion += lenencLen + val.getBytes().length;
+		writeIndex += lenencLen + val.getBytes().length;
 		return this;
 	}
 
@@ -336,14 +346,12 @@ public class ProxyBuffer {
 	}
 
 	public ProxyBuffer putBytes(int index, int length, byte[] bytes) {
-		buffer.limit(index + length);
 		buffer.position(index);
 		buffer.put(bytes);
 		return this;
 	}
 
 	public ProxyBuffer putByte(int index, byte val) {
-		buffer.limit(index + 1);
 		buffer.position(index);
 		buffer.put(val);
 		return this;
@@ -356,40 +364,40 @@ public class ProxyBuffer {
 	}
 
 	public ProxyBuffer writeNULString(String val) {
-		putNULString(writeState.optPostion, val);
-		writeState.optPostion += val.getBytes().length + 1;
+		putNULString(writeIndex, val);
+		writeIndex += val.getBytes().length + 1;
 		return this;
 	}
 
 	public byte[] readBytes(int length) {
-		byte[] bytes = this.getBytes(readState.optPostion, length);
-		readState.optPostion += length;
+		byte[] bytes = this.getBytes(readIndex, length);
+		readIndex += length;
 		return bytes;
 	}
 
 	public ProxyBuffer writeBytes(int length, byte[] bytes) {
-		this.putBytes(writeState.optPostion, length, bytes);
-		writeState.optPostion += length;
+		this.putBytes(writeIndex, length, bytes);
+		writeIndex += length;
 		return this;
 	}
 
 	public ProxyBuffer writeLenencBytes(byte[] bytes) {
-		putLenencInt(writeState.optPostion, bytes.length);
+		putLenencInt(writeIndex, bytes.length);
 		int offset = getLenencLength(bytes.length);
-		putBytes(writeState.optPostion + offset, bytes);
-		writeState.optPostion += offset + bytes.length;
+		putBytes(writeIndex + offset, bytes);
+		writeIndex += offset + bytes.length;
 		return this;
 	}
 
 	public ProxyBuffer writeByte(byte val) {
-		this.putByte(writeState.optPostion, val);
-		writeState.optPostion++;
+		this.putByte(writeIndex, val);
+		writeIndex++;
 		return this;
 	}
 
 	public byte readByte() {
-		byte val = getByte(readState.optPostion);
-		readState.optPostion++;
+		byte val = getByte(readIndex);
+		readIndex++;
 		return val;
 	}
 
@@ -405,7 +413,7 @@ public class ProxyBuffer {
 	 *            值
 	 * @return 长度
 	 */
-	private int getLenencLength(int lenenc) {
+	public static int getLenencLength(int lenenc) {
 		if (lenenc < 251) {
 			return 1;
 		} else if (lenenc >= 251 && lenenc < (1 << 16)) {
@@ -417,6 +425,7 @@ public class ProxyBuffer {
 		}
 	}
 
+	
 	public long getLenencInt(int index) {
 		long len = getInt(index, 1) & 0xff;
 		if (len == 0xfc) {
@@ -426,14 +435,14 @@ public class ProxyBuffer {
 		} else if (len == 0xfe) {
 			return getInt(index + 1, 8);
 		} else {
-			return getInt(index, 1);
+			return len;
 		}
 	}
 
 	public byte[] readLenencBytes() {
-		int len = (int) getLenencInt(readState.optPostion);
-		byte[] bytes = getBytes(readState.optPostion + getLenencLength(len), len);
-		readState.optPostion += getLenencLength(len) + len;
+		int len = (int) getLenencInt(readIndex);
+		byte[] bytes = getBytes(readIndex + getLenencLength(len), len);
+		readIndex += getLenencLength(len) + len;
 		return bytes;
 	}
 
@@ -444,27 +453,9 @@ public class ProxyBuffer {
 		return this;
 	}
 
-	/**
-	 * Reset to write状态，清除数据
-	 */
-	public void reset() {
-		inReading = false;
-		writeState.optPostion = 0;
-		writeState.optLimit = buffer.capacity();
-		writeState.curOptedLength = 0;
-		writeState.optedTotalLength = 0;
-		readState.optPostion = 0;
-		readState.optLimit = 0;
-		readState.curOptedLength = 0;
-		readState.optedTotalLength = 0;
+	@Override
+	public String toString() {
+		return "ProxyBuffer [buffer=" + buffer + ", writeIndex=" + writeIndex + ", readIndex=" + readIndex
+				+ ", readMark=" + readMark + ", inReading=" + inReading + "]";
 	}
-
-	public boolean frontUsing() {
-		return this.frontUsing;
-	}
-	public boolean backendUsing()
-	{
-		return !frontUsing;
-	}
-
 }

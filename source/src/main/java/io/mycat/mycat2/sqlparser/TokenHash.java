@@ -401,6 +401,7 @@ public class TokenHash {
     public static final long NVARCHAR     = 0x4927586d095L;
     public static final long OFFLINE      = 0x1d39b08d88L;
     public static final long OFFSET       = 0xb67b1e11L;
+    public static final long OFF          = 0xad84L;
     public static final long OLD_PASSWORD = 0xcaed8a26ad23f3f9L;
     public static final long ON           = 0x443L;
     public static final long ONE_SHOT     = 0x4b711f6af83L;
@@ -592,6 +593,7 @@ public class TokenHash {
     public static final long SUSPEND      = 0x220ffdebdfL;
     public static final long SWAPS        = 0x5319cadL;
     public static final long SWITCHES     = 0x57681886a32L;
+    public static final long SWITCH       = 0xd4fa9944L;
     public static final long SYSDATE      = 0x222b90810aL;
     public static final long SYSTEM_USER  = 0x5c159a1fd978d40L;
     public static final long TABLES       = 0xd82644fdL;
@@ -698,5 +700,15 @@ public class TokenHash {
     public static final long SQL_TSI_MONTH = 0x8c3f094f1b906a03L;
     public static final long SQL_TSI_QUARTER = 0xe9ec207893081b87L;
     public static final long SQL_TSI_YEAR = 0xea71ed7ecec4f35bL;
+    public static final long AUTOCOMMIT = 4190263402411880L;
+    public static final long   IFNULL=2366939740L;
+    public static final long  NULLIF=2988454060L;
+    public static final long REPL = 0x1eecefL;
+
+    public static void main(String[] args) {
+        MatchMethodGenerator.initShrinkCharTbl();
+    }
+
+
 
 }

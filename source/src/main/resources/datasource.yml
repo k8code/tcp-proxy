@@ -1,0 +1,14 @@
+replicas:
+  - name: test
+    repType: SINGLE_NODE
+    switchType: NOT_SWITCH
+    balanceType: BALANCE_NONE
+    mysqls:
+      - hostName: test
+        ip: 127.0.0.1
+        port: 3306
+        user: root
+        password: 123456
+        minCon: 1
+        maxCon: 10
+        maxRetryCount: 3

@@ -14,4 +14,9 @@ public int pkgLength;
  * 还有多少字节才结束，仅对跨多个Buffer的MySQL报文有意义（crossBuffer=true)
  */
 public int remainsBytes;
+@Override
+public String toString() {
+	return "MySQLPackageInf [pkgType=" + pkgType + ", crossBuffer=" + crossBuffer + ", startPos=" + startPos
+			+ ", endPos=" + endPos + ", pkgLength=" + pkgLength + ", remainsBytes=" + remainsBytes + "]";
+}
 }

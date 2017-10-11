@@ -1,91 +1,141 @@
 package io.mycat.mycat2.tasks;
 
 import java.io.IOException;
+import java.nio.channels.ClosedChannelException;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import io.mycat.mycat2.MySQLSession;
+import io.mycat.mycat2.MycatSession;
 import io.mycat.mysql.packet.ErrorPacket;
 import io.mycat.mysql.packet.MySQLPacket;
 import io.mycat.mysql.packet.QueryPacket;
 import io.mycat.proxy.ProxyBuffer;
+import io.mycat.util.ErrorCode;
 
 /**
  * Created by ynfeng on 2017/8/13.
  * <p>
  * 同步状态至后端数据库，包括：字符集，事务，隔离级别等
  */
-public class BackendSynchronzationTask extends AbstractBackendIOTask {
-	private static Logger logger = LoggerFactory.getLogger(BackendSynchronzationTask.class);
-	private static QueryPacket[] CMDS = new QueryPacket[3];
-	private int processCmd = 0;
+public class BackendSynchronzationTask extends AbstractBackendIOTask<MySQLSession> {
+    private static Logger logger = LoggerFactory.getLogger(BackendSynchronzationTask.class);
 
-	static {
-		QueryPacket isolationSynCmd = new QueryPacket();
-		isolationSynCmd.packetId = 0;
+    private int syncCmdNum = 0;
+    private MycatSession mycatSession;
 
-		QueryPacket charsetSynCmd = new QueryPacket();
-		charsetSynCmd.packetId = 0;
+    public BackendSynchronzationTask(MycatSession mycatSession,MySQLSession mySQLSession) throws IOException {
+        super(mySQLSession,true);
+        this.mycatSession = mycatSession;
+    }
 
-		QueryPacket transactionSynCmd = new QueryPacket();
-		transactionSynCmd.packetId = 0;
-
-		CMDS[0] = isolationSynCmd;
-		CMDS[1] = charsetSynCmd;
-		CMDS[2] = transactionSynCmd;
-	}
-
-	public BackendSynchronzationTask(MySQLSession session) throws IOException {
-		super(session);
-		this.processCmd = 0;
-		syncState(session);
-	}
-
-	private void syncState(MySQLSession session) throws IOException {
-		logger.info("synchronzation state to bakcend.session=" + session.toString());
-		ProxyBuffer frontBuffer = session.frontBuffer;
-		frontBuffer.reset();
-		// TODO 字符集映射和前端事务设置还未完成，这里只用隔离级别模拟实现(其实都是SET xxx效果一样)，回头补充
-		switch (processCmd) {
-		case 1:
-		case 2:
-		case 0:
-			CMDS[processCmd].sql = session.isolation.getCmd();
-			CMDS[processCmd].write(frontBuffer);
-
-			frontBuffer.flip();
-			session.writeToChannel(frontBuffer, session.backendChannel);
-			processCmd++;
-			break;
-		default:
-			this.finished(true);
-			break;
+    public void syncState(MycatSession mycatSession,MySQLSession mySQLSession) throws IOException {
+        ProxyBuffer proxyBuf = mySQLSession.proxyBuffer;
+        proxyBuf.reset();
+        QueryPacket queryPacket = new QueryPacket();
+        queryPacket.packetId = 0;
+        
+        queryPacket.sql = "";
+        if(!mySQLSession.getMySQLMetaBean().isSlaveNode()){
+        	//隔离级别同步
+        	if(mycatSession.isolation != mySQLSession.isolation){
+                queryPacket.sql += mycatSession.isolation.getCmd();
+                syncCmdNum++;
+            }
+            //提交方式同步
+            if(mycatSession.autoCommit != mySQLSession.autoCommit){
+                queryPacket.sql += mycatSession.autoCommit.getCmd();
+                syncCmdNum++;
+            }
 		}
+        //字符集同步
+        if (mycatSession.charSet.charsetIndex != mySQLSession.charSet.charsetIndex) {
+            //字符集同步,直接取主节点的字符集映射
+            //1.因为主节点必定存在
+            //2.从节点和主节点的mysql版本号必定一致
+            //3.所以直接取主节点
+            String charsetName = mySQLSession.getMySQLMetaBean().INDEX_TO_CHARSET.get(mycatSession.charSet.charsetIndex);
+            queryPacket.sql += "SET names " + charsetName + ";";
+            syncCmdNum++;
+        }
+        if (syncCmdNum > 0) {
+        	logger.debug("synchronzation state [{}]to bakcend.session={}",queryPacket.sql,mySQLSession.toString());
+            queryPacket.write(proxyBuf);
+            proxyBuf.flip();
+            proxyBuf.readIndex = proxyBuf.writeIndex;
+            try {
+            	session.writeToChannel();
+			}catch(ClosedChannelException e){
+				logger.debug("synchronzation state task end ");
+				if(session.getMycatSession()!=null){
+					session.close(false, "backend connection is closed!");
+				}
+				session.close(false, e.getMessage());
+				return;
+			} catch (Exception e) {
+				String errmsg = "backend state sync Error. " + e.getMessage();
+				errPkg = new ErrorPacket();
+				errPkg.packetId = 1;
+				errPkg.errno = ErrorCode.ER_UNKNOWN_ERROR;
+				errPkg.message = errmsg;
+				logger.error(errmsg);
+				e.printStackTrace();
+				this.finished(false);
+				
+			}
+        }else{
+        	finished(true);
+        }
+    }
+    
+    public int getSyncCmdNum(){
+    	return syncCmdNum;
+    }
 
-	}
-
-	@Override
-	public void onBackendRead(MySQLSession session) throws IOException {
-		session.frontBuffer.reset();
-		if (!session.readFromChannel(session.frontBuffer, session.backendChannel)
-				|| !session.resolveMySQLPackage(session.frontBuffer, session.curBackendMSQLPackgInf, false)) {// 没有读到数据或者报文不完整
+    @Override
+    public void onSocketRead(MySQLSession session) throws IOException {
+        session.proxyBuffer.reset();        
+		try {
+    		if (!session.readFromChannel()){
+    			return;
+    		}
+		}catch(ClosedChannelException e){
+			session.close(false, e.getMessage());
+			return;
+		}catch (IOException e) {
+			logger.error("the backend synchronzation task Error. {}",e.getMessage());
+			e.printStackTrace();
+			this.finished(false);
 			return;
 		}
-		if (session.curBackendMSQLPackgInf.pkgType == MySQLPacket.OK_PACKET) {
-			syncState(session);
-		} else {
-			// TODO 同步失败如何处理？？是否应该关闭此连接？？
-			errPkg = new ErrorPacket();
-			errPkg.read(session.frontBuffer);
-			logger.warn("backend state sync Error.Err No. " + errPkg.errno + "," + errPkg.message);
-			this.finished(false);
-		}
-	}
+        
+        boolean isAllOK = true;
+        while (syncCmdNum >0) {
+        	switch (session.resolveMySQLPackage(session.proxyBuffer, session.curMSQLPackgInf, true)) {
+			case Full:
+				if(session.curMSQLPackgInf.pkgType == MySQLPacket.ERROR_PACKET){
+					isAllOK = false;
+					syncCmdNum = 0;
+				}
+				break;
+			default:
+				return;
+        	}
+        	syncCmdNum --;
+        }
 
-	@Override
-	public void onBackendSocketClosed(MySQLSession userSession, boolean normal) {
-		logger.warn(" socket closed not handlerd" + session.toString());
-	}
-
+        if (isAllOK) {
+            session.autoCommit = mycatSession.autoCommit;
+            session.isolation = mycatSession.isolation;
+            session.charSet.charsetIndex = mycatSession.charSet.charsetIndex;
+            logger.debug("synchronzation state task end ");
+            finished(true);
+        } else {
+            errPkg = new ErrorPacket();
+            errPkg.read(session.proxyBuffer);
+            logger.error("backend state sync Error.Err No. " + errPkg.errno + "," + errPkg.message);
+            finished(false);
+        }
+    }
 }

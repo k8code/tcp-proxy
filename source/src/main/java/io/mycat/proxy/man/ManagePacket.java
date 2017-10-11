@@ -3,6 +3,8 @@ package io.mycat.proxy.man;
 import java.io.IOException;
 import java.nio.ByteBuffer;
 
+import io.mycat.proxy.ProxyBuffer;
+
 /**
  * 管理报文，3个字节的包头 ，其中前两个字节为包长度，第3个字节为包类型，最后为报文内容。
  * 
@@ -12,6 +14,7 @@ import java.nio.ByteBuffer;
 public abstract class ManagePacket {
 	// 两字节的报文长度+1字节的类型
 	public final static int packetHeaderSize = 3;
+
 	// 所有的报文类型都需要在这里统一声明
 	public static final byte PKG_FAILED = 0;
 	public static final byte PKG_SUCCESS = 1;
@@ -19,6 +22,18 @@ public abstract class ManagePacket {
 	public static final byte PKG_JOIN_REQ_ClUSTER = 3;
 	public static final byte PKG_JOIN_NOTIFY_ClUSTER = 4;
 	public static final byte PKG_JOIN_ACK_ClUSTER = 5;
+
+	public static final byte PKG_CONFIG_VERSION_REQ = 6;
+	public static final byte PKG_CONFIG_VERSION_RES = 7;
+	public static final byte PKG_CONFIG_REQ = 8;
+	public static final byte PKG_CONFIG_RES = 9;
+
+	public static final byte PKG_CONFIG_PREPARE = 10;
+	public static final byte PKG_CONFIG_CONFIRM = 11;
+	public static final byte PKG_CONFIG_COMMIT = 12;
+
+	public static final byte PKG_LEADER_NOTIFY = 13;
+
 	protected byte pkgType;
 	// 长度最长为2字节的short，即65535，长度包括包头3个字节在内
 	protected int pkgLength;
@@ -39,8 +54,6 @@ public abstract class ManagePacket {
 	 *            报文buffer
 	 * @param offset
 	 *            buffer解析位置偏移量
-	 * @param position
-	 *            buffer已读位置偏移量
 	 * @return 报文长度(Header长度+内容长度)
 	 * @throws IOException
 	 */
@@ -66,29 +79,29 @@ public abstract class ManagePacket {
 		this.pkgLength = pkgLength;
 	}
 
-	public void resolve(ProtocolBuffer buffer) {
+	public void resolve(ProxyBuffer buffer) {
 		buffer.skip(3);
 		this.resolveBody(buffer);
 	}
 
-	public abstract void resolveBody(ProtocolBuffer buffer);
+	public abstract void resolveBody(ProxyBuffer buffer);
 
 	/**
 	 * 报文内容写入到Buffer中（等待发送）
 	 * 
 	 * @param buffer
 	 */
-	public void writeTo(ProtocolBuffer buffer) {
-		int beginPos = buffer.optLimit;
-		buffer.optLimit=2;
+	public void writeTo(ProxyBuffer buffer) {
+		int beginPos = buffer.writeIndex;
+		buffer.writeIndex=2;
 		buffer.writeByte(this.pkgType);
 		this.writeBody(buffer);
 		// total length
-		int lastPos = buffer.optLimit;
-		buffer.optLimit = beginPos;
+		int lastPos = buffer.writeIndex;
+		buffer.writeIndex = beginPos;
 		buffer.writeFixInt(2, lastPos - packetHeaderSize);
-		buffer.optLimit = lastPos;
-
+		buffer.writeIndex = lastPos;
+		buffer.readIndex  = buffer.writeIndex;
 	}
 
 	/**
@@ -96,5 +109,5 @@ public abstract class ManagePacket {
 	 * 
 	 * @param buffer
 	 */
-	public abstract void writeBody(ProtocolBuffer buffer);
+	public abstract void writeBody(ProxyBuffer buffer);
 }
